@@ -1,0 +1,22 @@
+{
+  "name": "solidiy-test",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "node": "hardhat node",
+    "deploy": "hardhat run scripts/deploy.js --network sepolia",
+    "deploy:blindbox": "hardhat run scripts/deploy-blindbox.js --network sepolia"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "6.1.0",
+    "dotenv": "16.4.5",
+    "hardhat": "2.28.0"
+  }
+}
