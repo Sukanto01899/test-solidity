@@ -34,8 +34,10 @@ describe("BlindBox", function () {
     return { owner, user, other, coordinator, blindBox, tokenA, tokenB, tokenC };
   }
 
-  async function openBoxAndGetRequestId(blindBox, boxType, user) {
-    const tx = await blindBox.connect(user).openBox(boxType);
+  async function openBoxAndGetRequestId(blindBox, boxType, user, valueOverride) {
+    const price = await blindBox.boxPrices(boxType);
+    const value = valueOverride !== undefined ? valueOverride : price;
+    const tx = await blindBox.connect(user).openBox(boxType, { value });
     const receipt = await tx.wait();
     const event = receipt.logs.find((log) => log.fragment && log.fragment.name === "BoxOpened");
     return event.args.requestId;
@@ -121,5 +123,131 @@ describe("BlindBox", function () {
     await expect(
       blindBox.connect(other).rawFulfillRandomWords(requestId, [1])
     ).to.be.revertedWith("Only coordinator");
+  });
+
+  it("requires exact or higher fee and refunds excess", async function () {
+    const { blindBox, user } = await deployFixture();
+    const price = await blindBox.boxPrices(1);
+
+    await expect(
+      blindBox.connect(user).openBox(1, { value: price - 1n })
+    ).to.be.revertedWith("INSUFFICIENT_FEE");
+
+    const overpay = price + ethers.parseEther("0.00002");
+    const balanceBefore = await ethers.provider.getBalance(user.address);
+    const tx = await blindBox.connect(user).openBox(1, { value: overpay });
+    const receipt = await tx.wait();
+    const gasCost = receipt.gasUsed * receipt.gasPrice;
+    const balanceAfter = await ethers.provider.getBalance(user.address);
+    expect(balanceBefore - balanceAfter - gasCost).to.equal(price);
+  });
+
+  it("allows owner to update box price", async function () {
+    const { blindBox, owner } = await deployFixture();
+    const newPrice = ethers.parseEther("0.0002");
+    await expect(blindBox.connect(owner).setBoxPrice(2, newPrice))
+      .to.emit(blindBox, "BoxPriceUpdated")
+      .withArgs(2, newPrice);
+    expect(await blindBox.boxPrices(2)).to.equal(newPrice);
+  });
+
+  it("allows owner to cancel pending opens", async function () {
+    const { blindBox, user, owner } = await deployFixture();
+    const requestId = await openBoxAndGetRequestId(blindBox, 0, user);
+    expect(await blindBox.pendingRequestCount()).to.equal(1);
+
+    await expect(blindBox.connect(owner).cancelPendingOpen(requestId))
+      .to.emit(blindBox, "PendingOpenCanceled")
+      .withArgs(requestId, user.address, 0);
+    expect(await blindBox.pendingRequestCount()).to.equal(0);
+  });
+
+  it("rejects cancelPendingOpen from non-owner", async function () {
+    const { blindBox, user, other } = await deployFixture();
+    const requestId = await openBoxAndGetRequestId(blindBox, 0, user);
+    await expect(blindBox.connect(other).cancelPendingOpen(requestId)).to.be.revertedWith("Not owner");
+  });
+
+  it("allows owner to withdraw native balance", async function () {
+    const { blindBox, owner, user } = await deployFixture();
+    const price = await blindBox.boxPrices(1);
+    await blindBox.connect(user).openBox(1, { value: price });
+
+    const balanceBefore = await ethers.provider.getBalance(owner.address);
+    const tx = await blindBox.connect(owner).emergencyWithdraw(ethers.ZeroAddress, owner.address, price);
+    const receipt = await tx.wait();
+    const gasCost = receipt.gasUsed * receipt.gasPrice;
+    const balanceAfter = await ethers.provider.getBalance(owner.address);
+    expect(balanceAfter - balanceBefore + gasCost).to.equal(price);
+  });
+
+  it("fuzzes reward bounds for silver and gold", async function () {
+    const { blindBox, coordinator, tokenA, tokenB, tokenC, user } = await deployFixture();
+    const contractAddress = await blindBox.getAddress();
+
+    const mintAmount = ethers.parseEther("100000");
+    await tokenA.mint(contractAddress, mintAmount);
+    await tokenB.mint(contractAddress, mintAmount);
+    await tokenC.mint(contractAddress, mintAmount);
+
+    const iterations = 5;
+    for (let i = 0; i < iterations; i += 1) {
+      const boxType = i % 2 === 0 ? 1 : 2;
+      const config = await blindBox.getBoxConfig(boxType);
+      const requestId = await openBoxAndGetRequestId(blindBox, boxType, user);
+      await coordinator.fulfillRandomWords(contractAddress, requestId, 1000 + i);
+
+      const [tokens, amounts] = await blindBox.getPendingRewards(user.address);
+      expect(tokens.length).to.equal(config.numTokensToReward);
+      expect(amounts.length).to.equal(config.numTokensToReward);
+
+      const uniqueTokens = new Set(tokens.map((t) => t.toLowerCase()));
+      expect(uniqueTokens.size).to.equal(tokens.length);
+
+      for (const amount of amounts) {
+        expect(amount).to.be.greaterThanOrEqual(config.minAmount);
+        expect(amount).to.be.lessThanOrEqual(config.maxAmount);
+      }
+
+      await expect(blindBox.connect(user).claimAll()).to.emit(blindBox, "RewardClaimed");
+    }
+  });
+
+  it("fuzzes fee enforcement for paid box types", async function () {
+    const { blindBox, user } = await deployFixture();
+    const iterations = 10;
+
+    for (let i = 0; i < iterations; i += 1) {
+      const boxType = i % 2 === 0 ? 1 : 2;
+      const price = await blindBox.boxPrices(boxType);
+      const tooLow = price > 0n ? price - 1n : 0n;
+
+      await expect(
+        blindBox.connect(user).openBox(boxType, { value: tooLow })
+      ).to.be.revertedWith("INSUFFICIENT_FEE");
+
+      await expect(blindBox.connect(user).openBox(boxType, { value: price }))
+        .to.emit(blindBox, "BoxOpened");
+    }
+  });
+
+  it("returns last reward via getLastReward", async function () {
+    const { blindBox, coordinator, tokenA, tokenB, tokenC, user } = await deployFixture();
+    const contractAddress = await blindBox.getAddress();
+
+    const mintAmount = ethers.parseEther("10000");
+    await tokenA.mint(contractAddress, mintAmount);
+    await tokenB.mint(contractAddress, mintAmount);
+    await tokenC.mint(contractAddress, mintAmount);
+
+    const requestId = await openBoxAndGetRequestId(blindBox, 0, user);
+    await coordinator.fulfillRandomWords(contractAddress, requestId, 4242);
+
+    const [lastToken, lastAmount] = await blindBox.getLastReward(user.address);
+    expect(lastToken).to.not.equal(ethers.ZeroAddress);
+    expect(lastAmount).to.be.greaterThan(0);
+
+    const pending = await blindBox.pendingRewards(user.address, lastToken);
+    expect(pending).to.equal(lastAmount);
   });
 });

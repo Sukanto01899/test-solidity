@@ -1,31 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "@chainlink/contracts/src/v0.8/vrf/dev/interfaces/IVRFCoordinatorV2Plus.sol";
+import "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
+
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function balanceOf(address account) external view returns (uint256);
-}
-
-library VRFV2PlusClient {
-    struct ExtraArgsV1 {
-        bool nativePayment;
-    }
-
-    function encodeExtraArgsV1(ExtraArgsV1 memory extraArgs) internal pure returns (bytes memory) {
-        return abi.encode(extraArgs);
-    }
-}
-
-interface IVRFCoordinatorV2Plus {
-    function requestRandomWords(
-        bytes32 keyHash,
-        uint256 subId,
-        uint16 requestConfirmations,
-        uint32 callbackGasLimit,
-        uint32 numWords,
-        bytes calldata extraArgs
-    ) external returns (uint256 requestId);
 }
 
 /**
@@ -50,6 +32,12 @@ contract BlindBox {
         address user;
         uint8 boxType;
         address coordinator; // Store coordinator to handle config changes
+    }
+
+    struct TokenRange {
+        uint256 minAmount;
+        uint256 maxAmount;
+        bool enabled;
     }
 
     // Box type constants
@@ -78,6 +66,8 @@ contract BlindBox {
 
     // Box configurations
     mapping(uint8 => BoxConfig) public boxConfigs;
+    mapping(uint8 => uint256) public boxPrices;
+    mapping(uint8 => mapping(address => TokenRange)) public tokenRanges;
 
     // Request tracking
     mapping(uint256 => PendingOpen) public pendingOpens;
@@ -102,6 +92,8 @@ contract BlindBox {
         uint8 numTokensToReward,
         bool enabled
     );
+    event BoxPriceUpdated(uint8 indexed boxType, uint256 priceWei);
+    event TokenRangeUpdated(uint8 indexed boxType, address indexed token, uint256 minAmount, uint256 maxAmount, bool enabled);
     event RewardTokensUpdated(uint256 count);
     event BoxOpened(uint256 indexed requestId, address indexed user, uint8 indexed boxType);
     event RewardsQueued(address indexed user, address indexed token, uint256 amount);
@@ -181,18 +173,21 @@ contract BlindBox {
             numTokensToReward: 1,
             enabled: true
         });
+        boxPrices[FREE] = 0;
         boxConfigs[SILVER] = BoxConfig({
             minAmount: 500e18,
             maxAmount: 1000e18,
             numTokensToReward: 2,
             enabled: true
         });
+        boxPrices[SILVER] = 0.00003 ether;
         boxConfigs[GOLD] = BoxConfig({
             minAmount: 1000e18,
             maxAmount: 2500e18,
             numTokensToReward: 3,
             enabled: true
         });
+        boxPrices[GOLD] = 0.0001 ether;
 
         _setRewardTokens(initialTokens);
     }
@@ -202,13 +197,16 @@ contract BlindBox {
      * @param boxType Type of box to open (FREE, SILVER, or GOLD)
      * @return requestId The VRF request ID
      */
-    function openBox(uint8 boxType) external whenNotPaused validBoxType(boxType) returns (uint256 requestId) {
+    function openBox(uint8 boxType) external payable whenNotPaused validBoxType(boxType) returns (uint256 requestId) {
         BoxConfig memory config = boxConfigs[boxType];
         require(config.enabled, "BOX_DISABLED");
         require(config.maxAmount >= config.minAmount, "INVALID_RANGE");
         require(rewardTokens.length > 0, "NO_REWARD_TOKENS");
         require(config.numTokensToReward > 0, "INVALID_REWARD_COUNT");
         require(config.numTokensToReward <= rewardTokens.length, "NOT_ENOUGH_TOKENS");
+
+        uint256 price = boxPrices[boxType];
+        require(msg.value >= price, "INSUFFICIENT_FEE");
 
         // Check free box cooldown and update timestamp to prevent spamming
         if (boxType == FREE) {
@@ -220,19 +218,21 @@ contract BlindBox {
         }
 
         // Encode extra args for VRF
-        bytes memory extraArgs = VRFV2PlusClient.encodeExtraArgsV1(
+        bytes memory extraArgs = VRFV2PlusClient._argsToBytes(
             VRFV2PlusClient.ExtraArgsV1({ nativePayment: nativePayment })
         );
 
+        VRFV2PlusClient.RandomWordsRequest memory req = VRFV2PlusClient.RandomWordsRequest({
+            keyHash: keyHash,
+            subId: subscriptionId,
+            requestConfirmations: requestConfirmations,
+            callbackGasLimit: callbackGasLimit,
+            numWords: 1,
+            extraArgs: extraArgs
+        });
+
         // Request only 1 random word (we only need one)
-        requestId = IVRFCoordinatorV2Plus(vrfCoordinator).requestRandomWords(
-            keyHash,
-            subscriptionId,
-            requestConfirmations,
-            callbackGasLimit,
-            1, // numWords - fixed to 1 for efficiency
-            extraArgs
-        );
+        requestId = IVRFCoordinatorV2Plus(vrfCoordinator).requestRandomWords(req);
 
         // Store pending open with current coordinator address
         pendingOpens[requestId] = PendingOpen({
@@ -241,6 +241,11 @@ contract BlindBox {
             coordinator: vrfCoordinator
         });
         pendingRequestCount += 1;
+
+        if (msg.value > price) {
+            (bool refunded, ) = msg.sender.call{value: msg.value - price}("");
+            require(refunded, "Refund failed");
+        }
 
         emit BoxOpened(requestId, msg.sender, boxType);
     }
@@ -336,12 +341,17 @@ contract BlindBox {
             remaining -= 1;
 
             // Calculate random amount
+            TokenRange memory range = tokenRanges[pending.boxType][token];
+            uint256 minAmount = range.enabled ? range.minAmount : config.minAmount;
+            uint256 maxAmount = range.enabled ? range.maxAmount : config.maxAmount;
+            require(maxAmount >= minAmount, "INVALID_TOKEN_RANGE");
+
             uint256 amount = _randomAmount(
                 randomWords[0],
                 requestId,
                 i,
-                config.minAmount,
-                config.maxAmount
+                minAmount,
+                maxAmount
             );
 
             // Queue reward
@@ -465,6 +475,50 @@ contract BlindBox {
     }
 
     /**
+     * @notice Set box price in wei
+     * @param boxType Box type to configure
+     * @param priceWei Price in wei
+     */
+    function setBoxPrice(uint8 boxType, uint256 priceWei) external onlyOwner validBoxType(boxType) {
+        boxPrices[boxType] = priceWei;
+        emit BoxPriceUpdated(boxType, priceWei);
+    }
+
+    /**
+     * @notice Set per-token reward range for a specific box type
+     * @param boxType Box type to configure
+     * @param token Reward token address
+     * @param minAmount Minimum reward amount
+     * @param maxAmount Maximum reward amount
+     * @param enabled Whether to use this per-token range
+     */
+    function setTokenRange(
+        uint8 boxType,
+        address token,
+        uint256 minAmount,
+        uint256 maxAmount,
+        bool enabled
+    ) external onlyOwner validBoxType(boxType) {
+        require(token != address(0), "Zero token");
+        require(maxAmount >= minAmount, "Invalid range");
+        tokenRanges[boxType][token] = TokenRange({
+            minAmount: minAmount,
+            maxAmount: maxAmount,
+            enabled: enabled
+        });
+        emit TokenRangeUpdated(boxType, token, minAmount, maxAmount, enabled);
+    }
+
+    /**
+     * @notice Get per-token reward range for a specific box type
+     * @param boxType Box type to query
+     * @param token Reward token address
+     */
+    function getTokenRange(uint8 boxType, address token) external view returns (TokenRange memory) {
+        return tokenRanges[boxType][token];
+    }
+
+    /**
      * @notice Update reward tokens list
      * @param tokens New array of reward token addresses
      */
@@ -582,6 +636,17 @@ contract BlindBox {
      */
     function getRewardTokens() external view returns (address[] memory) {
         return rewardTokens;
+    }
+
+    /**
+     * @notice Get the most recent reward for a user
+     * @param user User address
+     * @return token Last reward token
+     * @return amount Last reward amount
+     */
+    function getLastReward(address user) external view returns (address token, uint256 amount) {
+        token = lastRewardToken[user];
+        amount = lastRewardAmount[user];
     }
 
     /**
