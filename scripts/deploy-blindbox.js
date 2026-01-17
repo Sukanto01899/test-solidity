@@ -23,46 +23,12 @@ async function main() {
     .map((token) => token.trim())
     .filter((token) => token.length > 0);
 
-  const BlindBox = await ethers.getContractFactory("BlindBox");
-  const blindBox = await BlindBox.deploy(
-    vrfCoordinator,
-    keyHash,
-    subscriptionId,
-    requestConfirmations,
-    callbackGasLimit,
-    nativePayment,
-    rewardTokens
-  );
-  await blindBox.waitForDeployment();
-
-  const address = await blindBox.getAddress();
-  console.log("BlindBox deployed to:", address);
-
-  const signer = (await ethers.getSigners())[0];
-
-  async function sendWithNonce(txFn) {
-    const maxAttempts = 3;
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      const nonce = await signer.getNonce("pending");
-      try {
-        const tx = await txFn(nonce);
-        return tx;
-      } catch (error) {
-        const message = (error && error.message) || "";
-        if (!message.includes("nonce too low") || attempt === maxAttempts) {
-          throw error;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-    }
-  }
-
   const tokenRanges = [
     {
       boxType: 0,
       items: [
-        { token: "0x0578d8a44db98b23bf096a382e016e29a5ce0ffe", min: "1", max: "3" },
-        { token: "0x4ed4e862860bed51a9570b96d89af5e1b0efefed", min: "1", max: "3" },
+        { token: "0x0578d8a44db98b23bf096a382e016e29a5ce0ffe", min: "1", max: "4" },
+        { token: "0x4ed4e862860bed51a9570b96d89af5e1b0efefed", min: "1", max: "4" },
         { token: "0xac1bd2486aaf3b5c0fc3fd868558b082a531b2b4", min: "5", max: "10" },
         { token: "0x532f27101965dd16442e59d40670faf5ebb142e4", min: "0.1", max: "1" },
         { token: "0x50f88fe97f72cd3e75b9eb4f747f59bceba80d59", min: "0.5", max: "2" },
@@ -90,19 +56,31 @@ async function main() {
     },
   ];
 
-  for (const group of tokenRanges) {
-    for (const item of group.items) {
-      const min = ethers.parseEther(item.min);
-      const max = ethers.parseEther(item.max);
-      const tx = await sendWithNonce((nonce) =>
-        blindBox
-          .connect(signer)
-          .setTokenRange(group.boxType, item.token, min, max, true, { nonce })
-      );
-      await tx.wait();
-      console.log(`Set box ${group.boxType} token ${item.token} range ${item.min}-${item.max}`);
-    }
-  }
+  const initialRanges = tokenRanges.flatMap((group) =>
+    group.items.map((item) => ({
+      boxType: group.boxType,
+      token: item.token,
+      minAmount: ethers.parseEther(item.min),
+      maxAmount: ethers.parseEther(item.max),
+      enabled: true,
+    }))
+  );
+
+  const BlindBox = await ethers.getContractFactory("BlindBox");
+  const blindBox = await BlindBox.deploy(
+    vrfCoordinator,
+    keyHash,
+    subscriptionId,
+    requestConfirmations,
+    callbackGasLimit,
+    nativePayment,
+    rewardTokens,
+    initialRanges
+  );
+  await blindBox.waitForDeployment();
+
+  const address = await blindBox.getAddress();
+  console.log("BlindBox deployed to:", address);
 
   const confirmTarget = Number(process.env.VERIFY_CONFIRMATIONS || 2);
   if (confirmTarget > 0) {
@@ -120,6 +98,7 @@ async function main() {
       callbackGasLimit,
       nativePayment,
       rewardTokens,
+      initialRanges,
     ],
   };
 

@@ -1,25 +1,24 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import "@chainlink/contracts/src/v0.8/vrf/dev/interfaces/IVRFCoordinatorV2Plus.sol";
 import "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
-
-interface IERC20 {
-    function transfer(address to, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-}
 
 /**
  * @title BlindBox
  * @notice A production-grade blind box system with Chainlink VRF v2 Plus for verifiable randomness
  * @dev Uses VRF for fair reward distribution across multiple box tiers
  */
-contract BlindBox {
-    uint256 private constant _NOT_ENTERED = 1;
-    uint256 private constant _ENTERED = 2;
+contract BlindBox is ReentrancyGuard, Pausable {
+    using ECDSA for bytes32;
+    using MessageHashUtils for bytes32;
+
     bytes4 private constant _TRANSFER_SELECTOR = 0xa9059cbb;
-    uint256 private _status;
 
     struct BoxConfig {
         uint256 minAmount;
@@ -40,6 +39,30 @@ contract BlindBox {
         bool enabled;
     }
 
+    struct TokenRangeInput {
+        uint8 boxType;
+        address token;
+        uint256 minAmount;
+        uint256 maxAmount;
+        bool enabled;
+    }
+
+    struct DebugOpenResult {
+        bool contractPaused;
+        bool validBox;
+        bool boxEnabled;
+        bool validRange;
+        bool hasRewardTokens;
+        bool validRewardCount;
+        bool enoughTokens;
+        bool freeCooldownPassed;
+        uint256 cooldownRemaining;
+        bool fidFreeCooldownPassed;
+        uint256 fidCooldownRemaining;
+        address vrfCoord;
+        uint256 subId;
+    }
+
     // Box type constants
     uint8 public constant FREE = 0;
     uint8 public constant SILVER = 1;
@@ -56,9 +79,7 @@ contract BlindBox {
     uint16 public requestConfirmations;
     uint32 public callbackGasLimit;
     bool public nativePayment;
-
-    // Emergency pause
-    bool public paused;
+    address public signerAddress;
 
     // Reward tokens
     address[] public rewardTokens;
@@ -76,15 +97,24 @@ contract BlindBox {
     // User rewards and tracking
     mapping(address => mapping(address => uint256)) public pendingRewards;
     mapping(address => uint256) public lastFreeOpenAt;
+    mapping(uint256 => uint256) public lastFreeOpenAtByFid;
     mapping(address => address) public lastRewardToken;
     mapping(address => uint256) public lastRewardAmount;
+    mapping(address => mapping(uint256 => bool)) public usedNonces;
+    mapping(uint256 => mapping(uint256 => bool)) public usedNoncesByFid;
 
     // Emergency withdrawal tracking
     mapping(address => uint256) public emergencyWithdrawn;
 
     // Events
-    event OwnershipTransferInitiated(address indexed previousOwner, address indexed newOwner);
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferInitiated(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
+    event OwnershipTransferred(
+        address indexed previousOwner,
+        address indexed newOwner
+    );
     event BoxConfigUpdated(
         uint8 indexed boxType,
         uint256 minAmount,
@@ -93,11 +123,29 @@ contract BlindBox {
         bool enabled
     );
     event BoxPriceUpdated(uint8 indexed boxType, uint256 priceWei);
-    event TokenRangeUpdated(uint8 indexed boxType, address indexed token, uint256 minAmount, uint256 maxAmount, bool enabled);
+    event TokenRangeUpdated(
+        uint8 indexed boxType,
+        address indexed token,
+        uint256 minAmount,
+        uint256 maxAmount,
+        bool enabled
+    );
     event RewardTokensUpdated(uint256 count);
-    event BoxOpened(uint256 indexed requestId, address indexed user, uint8 indexed boxType);
-    event RewardsQueued(address indexed user, address indexed token, uint256 amount);
-    event RewardClaimed(address indexed user, address indexed token, uint256 amount);
+    event BoxOpened(
+        uint256 indexed requestId,
+        address indexed user,
+        uint8 indexed boxType
+    );
+    event RewardsQueued(
+        address indexed user,
+        address indexed token,
+        uint256 amount
+    );
+    event RewardClaimed(
+        address indexed user,
+        address indexed token,
+        uint256 amount
+    );
     event VrfConfigUpdated(
         address coordinator,
         bytes32 keyHash,
@@ -106,26 +154,21 @@ contract BlindBox {
         uint32 callbackGasLimit,
         bool nativePayment
     );
-    event PendingOpenCanceled(uint256 indexed requestId, address indexed user, uint8 indexed boxType);
-    event Paused(address indexed by);
-    event Unpaused(address indexed by);
-    event EmergencyWithdrawal(address indexed token, address indexed to, uint256 amount);
+    event PendingOpenCanceled(
+        uint256 indexed requestId,
+        address indexed user,
+        uint8 indexed boxType
+    );
+    event EmergencyWithdrawal(
+        address indexed token,
+        address indexed to,
+        uint256 amount
+    );
+    event SignerUpdated(address indexed signer);
 
     // Modifiers
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
-        _;
-    }
-
-    modifier nonReentrant() {
-        require(_status != _ENTERED, "Reentrancy");
-        _status = _ENTERED;
-        _;
-        _status = _NOT_ENTERED;
-    }
-
-    modifier whenNotPaused() {
-        require(!paused, "Contract paused");
         _;
     }
 
@@ -143,6 +186,7 @@ contract BlindBox {
      * @param _callbackGasLimit Gas limit for callback
      * @param _nativePayment Whether to use native token for payment
      * @param initialTokens Initial reward token addresses
+     * @param initialRanges Initial per-token ranges
      */
     constructor(
         address _vrfCoordinator,
@@ -151,9 +195,9 @@ contract BlindBox {
         uint16 _requestConfirmations,
         uint32 _callbackGasLimit,
         bool _nativePayment,
-        address[] memory initialTokens
+        address[] memory initialTokens,
+        TokenRangeInput[] memory initialRanges
     ) {
-        _status = _NOT_ENTERED;
         owner = msg.sender;
         emit OwnershipTransferred(address(0), msg.sender);
 
@@ -190,49 +234,95 @@ contract BlindBox {
         boxPrices[GOLD] = 0.0001 ether;
 
         _setRewardTokens(initialTokens);
+        _setTokenRanges(initialRanges);
     }
 
     /**
      * @notice Open a blind box and request randomness
      * @param boxType Type of box to open (FREE, SILVER, or GOLD)
+     * @param fid Farcaster fid used for free box eligibility
+     * @param nonce Anti-replay nonce for signed free box opens
+     * @param signature Signature authorizing free box open (ignored for paid boxes)
      * @return requestId The VRF request ID
      */
-    function openBox(uint8 boxType) external payable whenNotPaused validBoxType(boxType) returns (uint256 requestId) {
+    function openBox(
+        uint8 boxType,
+        uint256 fid,
+        uint256 nonce,
+        bytes calldata signature
+    )
+        external
+        payable
+        whenNotPaused
+        validBoxType(boxType)
+        nonReentrant
+        returns (uint256 requestId)
+    {
         BoxConfig memory config = boxConfigs[boxType];
         require(config.enabled, "BOX_DISABLED");
         require(config.maxAmount >= config.minAmount, "INVALID_RANGE");
         require(rewardTokens.length > 0, "NO_REWARD_TOKENS");
         require(config.numTokensToReward > 0, "INVALID_REWARD_COUNT");
-        require(config.numTokensToReward <= rewardTokens.length, "NOT_ENOUGH_TOKENS");
+        require(
+            config.numTokensToReward <= rewardTokens.length,
+            "NOT_ENOUGH_TOKENS"
+        );
 
         uint256 price = boxPrices[boxType];
         require(msg.value >= price, "INSUFFICIENT_FEE");
 
         // Check free box cooldown and update timestamp to prevent spamming
         if (boxType == FREE) {
+            require(signerAddress != address(0), "SIGNER_NOT_SET");
+            require(!usedNonces[msg.sender][nonce], "NONCE_USED");
+            require(!usedNoncesByFid[fid][nonce], "FID_NONCE_USED");
+            bytes32 messageHash = keccak256(
+                abi.encodePacked(
+                    msg.sender,
+                    fid,
+                    boxType,
+                    nonce,
+                    address(this),
+                    block.chainid
+                )
+            );
+            address recoveredSigner = messageHash
+                .toEthSignedMessageHash()
+                .recover(signature);
+            require(recoveredSigner == signerAddress, "Invalid signature");
+            usedNonces[msg.sender][nonce] = true;
+            usedNoncesByFid[fid][nonce] = true;
             require(
                 block.timestamp >= lastFreeOpenAt[msg.sender] + 1 days,
                 "FREE_BOX_COOLDOWN"
             );
+            require(
+                block.timestamp >= lastFreeOpenAtByFid[fid] + 1 days,
+                "FID_FREE_BOX_COOLDOWN"
+            );
             lastFreeOpenAt[msg.sender] = block.timestamp;
+            lastFreeOpenAtByFid[fid] = block.timestamp;
         }
 
         // Encode extra args for VRF
         bytes memory extraArgs = VRFV2PlusClient._argsToBytes(
-            VRFV2PlusClient.ExtraArgsV1({ nativePayment: nativePayment })
+            VRFV2PlusClient.ExtraArgsV1({nativePayment: nativePayment})
         );
 
-        VRFV2PlusClient.RandomWordsRequest memory req = VRFV2PlusClient.RandomWordsRequest({
-            keyHash: keyHash,
-            subId: subscriptionId,
-            requestConfirmations: requestConfirmations,
-            callbackGasLimit: callbackGasLimit,
-            numWords: 1,
-            extraArgs: extraArgs
-        });
+        VRFV2PlusClient.RandomWordsRequest memory req = VRFV2PlusClient
+            .RandomWordsRequest({
+                keyHash: keyHash,
+                subId: subscriptionId,
+                requestConfirmations: requestConfirmations,
+                callbackGasLimit: callbackGasLimit,
+                numWords: 1,
+                extraArgs: extraArgs
+            });
 
         // Request only 1 random word (we only need one)
-        requestId = IVRFCoordinatorV2Plus(vrfCoordinator).requestRandomWords(req);
+        requestId = IVRFCoordinatorV2Plus(vrfCoordinator).requestRandomWords(
+            req
+        );
 
         // Store pending open with current coordinator address
         pendingOpens[requestId] = PendingOpen({
@@ -254,52 +344,48 @@ contract BlindBox {
      * @notice Debug function to check openBox prerequisites
      * @param boxType Type of box to check
      * @param user Address of user
-     * @return contractPaused Whether contract is paused
-     * @return validBox Whether box type is valid
-     * @return boxEnabled Whether box is enabled
-     * @return validRange Whether min/max range is valid
-     * @return hasRewardTokens Whether reward tokens exist
-     * @return validRewardCount Whether reward count is valid
-     * @return enoughTokens Whether enough tokens for rewards
-     * @return freeCooldownPassed Whether free box cooldown passed
-     * @return cooldownRemaining Seconds remaining for cooldown
-     * @return vrfCoord VRF coordinator address
-     * @return subId VRF subscription ID
+     * @param fid Farcaster fid to check
+     * @return result Struct containing all debug flags and values
      */
-    function debugOpenBox(uint8 boxType, address user) external view returns (
-        bool contractPaused,
-        bool validBox,
-        bool boxEnabled,
-        bool validRange,
-        bool hasRewardTokens,
-        bool validRewardCount,
-        bool enoughTokens,
-        bool freeCooldownPassed,
-        uint256 cooldownRemaining,
-        address vrfCoord,
-        uint256 subId
-    ) {
-        contractPaused = paused;
-        validBox = boxType <= GOLD;
-        
+    function debugOpenBox(
+        uint8 boxType,
+        address user,
+        uint256 fid
+    )
+        external
+        view
+        returns (DebugOpenResult memory result)
+    {
+        result.contractPaused = paused();
+        result.validBox = boxType <= GOLD;
+
         BoxConfig memory config = boxConfigs[boxType];
-        boxEnabled = config.enabled;
-        validRange = config.maxAmount >= config.minAmount;
-        hasRewardTokens = rewardTokens.length > 0;
-        validRewardCount = config.numTokensToReward > 0;
-        enoughTokens = config.numTokensToReward <= rewardTokens.length;
-        
+        result.boxEnabled = config.enabled;
+        result.validRange = config.maxAmount >= config.minAmount;
+        result.hasRewardTokens = rewardTokens.length > 0;
+        result.validRewardCount = config.numTokensToReward > 0;
+        result.enoughTokens = config.numTokensToReward <= rewardTokens.length;
+
         if (boxType == FREE) {
             uint256 nextAllowed = lastFreeOpenAt[user] + 1 days;
-            freeCooldownPassed = block.timestamp >= nextAllowed;
-            cooldownRemaining = freeCooldownPassed ? 0 : nextAllowed - block.timestamp;
+            result.freeCooldownPassed = block.timestamp >= nextAllowed;
+            result.cooldownRemaining = result.freeCooldownPassed
+                ? 0
+                : nextAllowed - block.timestamp;
+            uint256 nextAllowedFid = lastFreeOpenAtByFid[fid] + 1 days;
+            result.fidFreeCooldownPassed = block.timestamp >= nextAllowedFid;
+            result.fidCooldownRemaining = result.fidFreeCooldownPassed
+                ? 0
+                : nextAllowedFid - block.timestamp;
         } else {
-            freeCooldownPassed = true;
-            cooldownRemaining = 0;
+            result.freeCooldownPassed = true;
+            result.cooldownRemaining = 0;
+            result.fidFreeCooldownPassed = true;
+            result.fidCooldownRemaining = 0;
         }
-        
-        vrfCoord = vrfCoordinator;
-        subId = subscriptionId;
+
+        result.vrfCoord = vrfCoordinator;
+        result.subId = subscriptionId;
     }
 
     /**
@@ -307,54 +393,48 @@ contract BlindBox {
      * @param requestId The request ID
      * @param randomWords Array of random values from VRF
      */
-    function rawFulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) external {
+    function rawFulfillRandomWords(
+        uint256 requestId,
+        uint256[] calldata randomWords
+    ) external {
         PendingOpen memory pending = pendingOpens[requestId];
-        
+
         // Validate caller is the coordinator that made the request
         require(msg.sender == pending.coordinator, "Only coordinator");
         require(pending.user != address(0), "Unknown request");
         require(randomWords.length > 0, "No random words");
-        
+
         delete pendingOpens[requestId];
         require(pendingRequestCount > 0, "No pending requests");
         pendingRequestCount -= 1;
 
         BoxConfig memory config = boxConfigs[pending.boxType];
-        uint256 poolSize = rewardTokens.length;
-        
-        // Create a working copy of the token pool for selection without replacement
-        address[] memory pool = new address[](poolSize);
-        for (uint256 i = 0; i < poolSize; i++) {
-            pool[i] = rewardTokens[i];
-        }
-        
-        uint256 remaining = poolSize;
+        address[] memory pool = _copyRewardTokens();
+        uint256 remaining = pool.length;
+        uint256 randomWord = randomWords[0];
 
         // Select tokens and amounts for rewards
         for (uint256 i = 0; i < config.numTokensToReward; i++) {
-            // Select random token from remaining pool
-            uint256 idx = uint256(keccak256(abi.encode(randomWords[0], requestId, i, "token"))) % remaining;
+            uint256 idx = uint256(
+                keccak256(abi.encode(randomWord, requestId, i, "token"))
+            ) % remaining;
             address token = pool[idx];
-            
-            // Remove selected token from pool (swap with last)
             pool[idx] = pool[remaining - 1];
             remaining -= 1;
 
-            // Calculate random amount
-            TokenRange memory range = tokenRanges[pending.boxType][token];
-            uint256 minAmount = range.enabled ? range.minAmount : config.minAmount;
-            uint256 maxAmount = range.enabled ? range.maxAmount : config.maxAmount;
-            require(maxAmount >= minAmount, "INVALID_TOKEN_RANGE");
-
+            (uint256 minAmount, uint256 maxAmount) = _resolveRange(
+                pending.boxType,
+                token,
+                config
+            );
             uint256 amount = _randomAmount(
-                randomWords[0],
+                randomWord,
                 requestId,
                 i,
                 minAmount,
                 maxAmount
             );
 
-            // Queue reward
             pendingRewards[pending.user][token] += amount;
             lastRewardToken[pending.user] = token;
             lastRewardAmount[pending.user] = amount;
@@ -368,16 +448,18 @@ contract BlindBox {
      * @param token The token address to claim
      * @return amount The amount claimed
      */
-    function claim(address token) external whenNotPaused nonReentrant returns (uint256 amount) {
+    function claim(
+        address token
+    ) external whenNotPaused nonReentrant returns (uint256 amount) {
         amount = pendingRewards[msg.sender][token];
         require(amount > 0, "Nothing to claim");
-        
+
         // Check contract has sufficient balance
         uint256 balance = IERC20(token).balanceOf(address(this));
         require(balance >= amount, "Insufficient contract balance");
-        
+
         pendingRewards[msg.sender][token] = 0;
-        
+
         _safeTransfer(token, msg.sender, amount);
         emit RewardClaimed(msg.sender, token, amount);
     }
@@ -388,15 +470,15 @@ contract BlindBox {
      */
     function claimAll() external whenNotPaused nonReentrant {
         bool anySuccess = false;
-        
+
         for (uint256 i = 0; i < rewardTokens.length; i++) {
             address token = rewardTokens[i];
             uint256 amount = pendingRewards[msg.sender][token];
-            
+
             if (amount > 0) {
                 // Check balance before attempting transfer
                 uint256 balance = IERC20(token).balanceOf(address(this));
-                
+
                 if (balance >= amount) {
                     pendingRewards[msg.sender][token] = 0;
 
@@ -409,7 +491,7 @@ contract BlindBox {
                 }
             }
         }
-        
+
         require(anySuccess, "No rewards claimed");
     }
 
@@ -419,20 +501,26 @@ contract BlindBox {
      * @return tokens Array of token addresses with pending rewards
      * @return amounts Array of pending amounts for each token
      */
-    function getPendingRewards(address user) external view returns (address[] memory tokens, uint256[] memory amounts) {
+    function getPendingRewards(
+        address user
+    )
+        external
+        view
+        returns (address[] memory tokens, uint256[] memory amounts)
+    {
         uint256 count = 0;
-        
+
         // Count non-zero rewards
         for (uint256 i = 0; i < rewardTokens.length; i++) {
             if (pendingRewards[user][rewardTokens[i]] > 0) {
                 count++;
             }
         }
-        
+
         tokens = new address[](count);
         amounts = new uint256[](count);
         uint256 idx = 0;
-        
+
         // Populate arrays
         for (uint256 i = 0; i < rewardTokens.length; i++) {
             address token = rewardTokens[i];
@@ -462,16 +550,25 @@ contract BlindBox {
     ) external onlyOwner validBoxType(boxType) {
         require(maxAmount >= minAmount, "Invalid range");
         require(minAmount > 0, "Min amount must be > 0");
-        require(numTokensToReward > 0 || !enabled, "Must reward tokens if enabled");
-        
+        require(
+            numTokensToReward > 0 || !enabled,
+            "Must reward tokens if enabled"
+        );
+
         boxConfigs[boxType] = BoxConfig({
             minAmount: minAmount,
             maxAmount: maxAmount,
             numTokensToReward: numTokensToReward,
             enabled: enabled
         });
-        
-        emit BoxConfigUpdated(boxType, minAmount, maxAmount, numTokensToReward, enabled);
+
+        emit BoxConfigUpdated(
+            boxType,
+            minAmount,
+            maxAmount,
+            numTokensToReward,
+            enabled
+        );
     }
 
     /**
@@ -479,7 +576,10 @@ contract BlindBox {
      * @param boxType Box type to configure
      * @param priceWei Price in wei
      */
-    function setBoxPrice(uint8 boxType, uint256 priceWei) external onlyOwner validBoxType(boxType) {
+    function setBoxPrice(
+        uint8 boxType,
+        uint256 priceWei
+    ) external onlyOwner validBoxType(boxType) {
         boxPrices[boxType] = priceWei;
         emit BoxPriceUpdated(boxType, priceWei);
     }
@@ -499,14 +599,17 @@ contract BlindBox {
         uint256 maxAmount,
         bool enabled
     ) external onlyOwner validBoxType(boxType) {
-        require(token != address(0), "Zero token");
-        require(maxAmount >= minAmount, "Invalid range");
-        tokenRanges[boxType][token] = TokenRange({
-            minAmount: minAmount,
-            maxAmount: maxAmount,
-            enabled: enabled
-        });
-        emit TokenRangeUpdated(boxType, token, minAmount, maxAmount, enabled);
+        _setTokenRangeInternal(boxType, token, minAmount, maxAmount, enabled);
+    }
+
+    /**
+     * @notice Batch set per-token reward ranges
+     * @param ranges Array of range configs
+     */
+    function setTokenRanges(
+        TokenRangeInput[] calldata ranges
+    ) external onlyOwner {
+        _setTokenRanges(ranges);
     }
 
     /**
@@ -514,7 +617,10 @@ contract BlindBox {
      * @param boxType Box type to query
      * @param token Reward token address
      */
-    function getTokenRange(uint8 boxType, address token) external view returns (TokenRange memory) {
+    function getTokenRange(
+        uint8 boxType,
+        address token
+    ) external view returns (TokenRange memory) {
         return tokenRanges[boxType][token];
     }
 
@@ -550,17 +656,27 @@ contract BlindBox {
     }
 
     /**
+     * @notice Update signer address for free box authorizations
+     * @param _signer Address allowed to sign free box authorizations
+     */
+    function setSignerAddress(address _signer) external onlyOwner {
+        require(_signer != address(0), "Zero signer");
+        signerAddress = _signer;
+        emit SignerUpdated(_signer);
+    }
+
+    /**
      * @notice Cancel a pending open request (admin rescue)
      * @param requestId The VRF request ID to cancel
      */
     function cancelPendingOpen(uint256 requestId) external onlyOwner {
         PendingOpen memory pending = pendingOpens[requestId];
         require(pending.user != address(0), "Unknown request");
-        
+
         delete pendingOpens[requestId];
         require(pendingRequestCount > 0, "No pending requests");
         pendingRequestCount -= 1;
-        
+
         emit PendingOpenCanceled(requestId, pending.user, pending.boxType);
     }
 
@@ -571,7 +687,7 @@ contract BlindBox {
     function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0), "Zero address");
         require(newOwner != owner, "Same owner");
-        
+
         pendingOwner = newOwner;
         emit OwnershipTransferInitiated(owner, newOwner);
     }
@@ -581,11 +697,11 @@ contract BlindBox {
      */
     function acceptOwnership() external {
         require(msg.sender == pendingOwner, "Not pending owner");
-        
+
         address oldOwner = owner;
         owner = pendingOwner;
         pendingOwner = address(0);
-        
+
         emit OwnershipTransferred(oldOwner, owner);
     }
 
@@ -593,18 +709,14 @@ contract BlindBox {
      * @notice Pause the contract
      */
     function pause() external onlyOwner {
-        require(!paused, "Already paused");
-        paused = true;
-        emit Paused(msg.sender);
+        _pause();
     }
 
     /**
      * @notice Unpause the contract
      */
     function unpause() external onlyOwner {
-        require(paused, "Not paused");
-        paused = false;
-        emit Unpaused(msg.sender);
+        _unpause();
     }
 
     /**
@@ -613,10 +725,14 @@ contract BlindBox {
      * @param to Destination address
      * @param amount Amount to withdraw
      */
-    function emergencyWithdraw(address token, address to, uint256 amount) external onlyOwner nonReentrant {
+    function emergencyWithdraw(
+        address token,
+        address to,
+        uint256 amount
+    ) external onlyOwner nonReentrant {
         require(to != address(0), "Zero address");
         require(amount > 0, "Zero amount");
-        
+
         if (token == address(0)) {
             // Native token withdrawal
             (bool success, ) = to.call{value: amount}("");
@@ -625,7 +741,7 @@ contract BlindBox {
             // ERC20 withdrawal
             _safeTransfer(token, to, amount);
         }
-        
+
         emergencyWithdrawn[token] += amount;
         emit EmergencyWithdrawal(token, to, amount);
     }
@@ -644,7 +760,9 @@ contract BlindBox {
      * @return token Last reward token
      * @return amount Last reward amount
      */
-    function getLastReward(address user) external view returns (address token, uint256 amount) {
+    function getLastReward(
+        address user
+    ) external view returns (address token, uint256 amount) {
         token = lastRewardToken[user];
         amount = lastRewardAmount[user];
     }
@@ -654,12 +772,14 @@ contract BlindBox {
      * @param boxType Box type to query
      * @return Box configuration struct with min/max amounts and settings
      */
-    function getBoxConfig(uint8 boxType) external view validBoxType(boxType) returns (BoxConfig memory) {
+    function getBoxConfig(
+        uint8 boxType
+    ) external view validBoxType(boxType) returns (BoxConfig memory) {
         return boxConfigs[boxType];
     }
 
     /**
-     * @notice Check if user can open free box
+     * @notice Check if user can open free box (per-wallet cooldown)
      * @param user User address
      * @return Whether user can currently open a free box
      */
@@ -668,12 +788,38 @@ contract BlindBox {
     }
 
     /**
-     * @notice Get time until next free box
+     * @notice Check if fid can open free box (per-fid cooldown)
+     * @param fid Farcaster fid
+     * @return Whether fid can currently open a free box
+     */
+    function canOpenFreeBoxByFid(uint256 fid) external view returns (bool) {
+        return block.timestamp >= lastFreeOpenAtByFid[fid] + 1 days;
+    }
+
+    /**
+     * @notice Get time until next free box (per-wallet cooldown)
      * @param user User address
      * @return Seconds until next free box is available (0 if ready)
      */
-    function timeUntilNextFreeBox(address user) external view returns (uint256) {
+    function timeUntilNextFreeBox(
+        address user
+    ) external view returns (uint256) {
         uint256 nextTime = lastFreeOpenAt[user] + 1 days;
+        if (block.timestamp >= nextTime) {
+            return 0;
+        }
+        return nextTime - block.timestamp;
+    }
+
+    /**
+     * @notice Get time until next free box (per-fid cooldown)
+     * @param fid Farcaster fid
+     * @return Seconds until next free box is available (0 if ready)
+     */
+    function timeUntilNextFreeBoxByFid(
+        uint256 fid
+    ) external view returns (uint256) {
+        uint256 nextTime = lastFreeOpenAtByFid[fid] + 1 days;
         if (block.timestamp >= nextTime) {
             return 0;
         }
@@ -687,7 +833,7 @@ contract BlindBox {
     function _setRewardTokens(address[] memory tokens) internal {
         require(tokens.length > 0, "Empty tokens array");
         require(tokens.length <= 100, "Too many tokens"); // Reasonable limit
-        
+
         // Clear existing tokens
         for (uint256 i = 0; i < rewardTokens.length; i++) {
             rewardTokenExists[rewardTokens[i]] = false;
@@ -698,14 +844,66 @@ contract BlindBox {
         for (uint256 i = 0; i < tokens.length; i++) {
             address token = tokens[i];
             require(token != address(0), "Zero token");
-            
+
             if (!rewardTokenExists[token]) {
                 rewardTokenExists[token] = true;
                 rewardTokens.push(token);
             }
         }
-        
+
         emit RewardTokensUpdated(rewardTokens.length);
+    }
+
+    function _setTokenRangeInternal(
+        uint8 boxType,
+        address token,
+        uint256 minAmount,
+        uint256 maxAmount,
+        bool enabled
+    ) internal {
+        require(boxType <= GOLD, "Invalid box type");
+        require(token != address(0), "Zero token");
+        require(maxAmount >= minAmount, "Invalid range");
+        tokenRanges[boxType][token] = TokenRange({
+            minAmount: minAmount,
+            maxAmount: maxAmount,
+            enabled: enabled
+        });
+        emit TokenRangeUpdated(boxType, token, minAmount, maxAmount, enabled);
+    }
+
+    function _setTokenRanges(
+        TokenRangeInput[] memory ranges
+    ) internal {
+        for (uint256 i = 0; i < ranges.length; i++) {
+            TokenRangeInput memory r = ranges[i];
+            _setTokenRangeInternal(
+                r.boxType,
+                r.token,
+                r.minAmount,
+                r.maxAmount,
+                r.enabled
+            );
+        }
+    }
+
+    function _copyRewardTokens() internal view returns (address[] memory pool) {
+        uint256 len = rewardTokens.length;
+        pool = new address[](len);
+        for (uint256 i = 0; i < len; i++) {
+            pool[i] = rewardTokens[i];
+        }
+    }
+
+    function _resolveRange(
+        uint8 boxType,
+        address token,
+        BoxConfig memory config
+    ) internal view returns (uint256 minAmount, uint256 maxAmount) {
+        TokenRange memory range = tokenRanges[boxType][token];
+        minAmount = range.enabled ? range.minAmount : config.minAmount;
+        maxAmount = range.enabled ? range.maxAmount : config.maxAmount;
+        require(maxAmount >= minAmount, "INVALID_TOKEN_RANGE");
     }
 
     /**
@@ -723,14 +921,14 @@ contract BlindBox {
         require(_subscriptionId > 0, "Invalid subscription");
         require(_callbackGasLimit >= 100000, "Gas limit too low");
         require(_requestConfirmations > 0, "Invalid confirmations");
-        
+
         vrfCoordinator = _vrfCoordinator;
         keyHash = _keyHash;
         subscriptionId = _subscriptionId;
         requestConfirmations = _requestConfirmations;
         callbackGasLimit = _callbackGasLimit;
         nativePayment = _nativePayment;
-        
+
         emit VrfConfigUpdated(
             _vrfCoordinator,
             _keyHash,
@@ -745,10 +943,17 @@ contract BlindBox {
         (bool success, bytes memory data) = token.call(
             abi.encodeWithSelector(_TRANSFER_SELECTOR, to, amount)
         );
-        require(success && (data.length == 0 || abi.decode(data, (bool))), "Transfer failed");
+        require(
+            success && (data.length == 0 || abi.decode(data, (bool))),
+            "Transfer failed"
+        );
     }
 
-    function _trySafeTransfer(address token, address to, uint256 amount) internal returns (bool) {
+    function _trySafeTransfer(
+        address token,
+        address to,
+        uint256 amount
+    ) internal returns (bool) {
         (bool success, bytes memory data) = token.call(
             abi.encodeWithSelector(_TRANSFER_SELECTOR, to, amount)
         );
@@ -773,7 +978,9 @@ contract BlindBox {
     ) internal pure returns (uint256) {
         // For inclusive range [min, max]: range = max - min + 1
         uint256 range = maxAmount - minAmount + 1;
-        uint256 seed = uint256(keccak256(abi.encode(randomWord, requestId, index, "amount")));
+        uint256 seed = uint256(
+            keccak256(abi.encode(randomWord, requestId, index, "amount"))
+        );
         return minAmount + (seed % range);
     }
 
@@ -788,20 +995,24 @@ contract BlindBox {
      * @return silverEnabled Whether SILVER box is enabled
      * @return goldEnabled Whether GOLD box is enabled
      */
-    function getContractState() external view returns (
-        address _owner,
-        address _vrfCoordinator,
-        uint256 _subscriptionId,
-        bool _paused,
-        uint256 _rewardTokenCount,
-        bool freeEnabled,
-        bool silverEnabled,
-        bool goldEnabled
-    ) {
+    function getContractState()
+        external
+        view
+        returns (
+            address _owner,
+            address _vrfCoordinator,
+            uint256 _subscriptionId,
+            bool _paused,
+            uint256 _rewardTokenCount,
+            bool freeEnabled,
+            bool silverEnabled,
+            bool goldEnabled
+        )
+    {
         _owner = owner;
         _vrfCoordinator = vrfCoordinator;
         _subscriptionId = subscriptionId;
-        _paused = paused;
+        _paused = paused();
         _rewardTokenCount = rewardTokens.length;
         freeEnabled = boxConfigs[FREE].enabled;
         silverEnabled = boxConfigs[SILVER].enabled;
