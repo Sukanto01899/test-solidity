@@ -5,6 +5,9 @@ const {
   SEPOLIA_RPC_URL,
   BASE_RPC_URL,
   BASE_SEPOLIA_RPC_URL,
+  OP_RPC_URL,
+  ARB_RPC_URL,
+  CELO_RPC_URL,
   PRIVATE_KEY,
   ETHERSCAN_API_KEY,
   BASESCAN_API_KEY,
@@ -65,6 +68,18 @@ module.exports = {
     },
     "base-sepolia": {
       url: BASE_SEPOLIA_RPC_URL || "",
+      accounts: PRIVATE_KEY ? [PRIVATE_KEY] : [],
+    },
+    op: {
+      url: OP_RPC_URL || "",
+      accounts: PRIVATE_KEY ? [PRIVATE_KEY] : [],
+    },
+    arb: {
+      url: ARB_RPC_URL || "",
+      accounts: PRIVATE_KEY ? [PRIVATE_KEY] : [],
+    },
+    celo: {
+      url: CELO_RPC_URL || "",
       accounts: PRIVATE_KEY ? [PRIVATE_KEY] : [],
     },
   },
